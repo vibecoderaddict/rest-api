@@ -1,0 +1,307 @@
+name: PR Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-quality-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests and coverage
+        id: go_test
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Run go vet
+        id: go_vet
+        run: go vet ./...
+
+      - name: Install OpenGrep
+        if: always()
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/092c80faa0817840228349f93eff12a50fb9cf6b/install.sh \
+            | bash -s -- -v v1.33.1
+          echo "$HOME/.opengrep/cli/latest" >> "$GITHUB_PATH"
+
+      - name: Run OpenGrep SAST
+        id: opengrep
+        if: always()
+        continue-on-error: true
+        run: |
+          opengrep scan \
+            --config p/security-audit \
+            --config security-fixtures/opengrep-rules.yml \
+            --json-output=opengrep.json \
+            --sarif-output=opengrep.sarif .
+
+      - name: Install Gitleaks
+        if: always()
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Run Gitleaks secret scan
+        id: gitleaks
+        if: always()
+        continue-on-error: true
+        run: |
+          gitleaks dir . \
+            --redact \
+            --report-format json \
+            --report-path gitleaks.json \
+            --exit-code 0
+
+      - name: Run Trivy filesystem scan
+        id: trivy_fs
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          format: json
+          output: trivy-fs.json
+          exit-code: '0'
+
+      - name: Prepare PR report
+        id: report
+        if: always()
+        run: |
+          opengrep_findings=0
+          opengrep_blockers=0
+          gitleaks_findings=0
+          trivy_findings=0
+          if [[ -f opengrep.json ]]; then
+            opengrep_findings=$(jq '[.results[]?] | length' opengrep.json 2>/dev/null || echo unavailable)
+            opengrep_blockers=$(jq '[.results[]? | select(.extra.severity == "ERROR")] | length' opengrep.json 2>/dev/null || echo unavailable)
+          fi
+          if [[ -f gitleaks.json ]]; then
+            gitleaks_findings=$(jq 'length' gitleaks.json 2>/dev/null || echo unavailable)
+          fi
+          if [[ -f trivy-fs.json ]]; then
+            trivy_findings=$(jq '[.Results[]?.Vulnerabilities[]?, .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?] | length' trivy-fs.json 2>/dev/null || echo unavailable)
+          fi
+          trivy_blockers=0
+          if [[ -f trivy-fs.json ]]; then
+            trivy_blockers=$(jq '[
+              .Results[]?.Vulnerabilities[]?
+              | select(.Severity == "HIGH" or .Severity == "CRITICAL")
+              | select((.FixedVersion // "") != "")
+            ] + [
+              .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?
+              | select(.Severity == "HIGH" or .Severity == "CRITICAL")
+            ] | length' trivy-fs.json 2>/dev/null || echo unavailable)
+          fi
+          trivy_status="${{ steps.trivy_fs.outcome }}"
+          if [[ "$trivy_status" == "success" && "$trivy_blockers" != "0" ]]; then
+            trivy_status=failure
+          fi
+          opengrep_status="${{ steps.opengrep.outcome }}"
+          if [[ "$opengrep_status" == "success" && "$opengrep_blockers" != "0" ]]; then
+            opengrep_status=failure
+          fi
+          gitleaks_status="${{ steps.gitleaks.outcome }}"
+          if [[ "$gitleaks_status" == "success" && "$gitleaks_findings" != "0" ]]; then
+            gitleaks_status=failure
+          fi
+          opengrep_report=$(jq -r '
+            [.results[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.check_id)` [\(.extra.severity)] \(.path):\(.start.line) - \(.extra.message)"
+              end
+          ' opengrep.json 2>/dev/null || echo '- Unavailable')
+          gitleaks_report=$(jq -r '
+            if length == 0 then "- None"
+            else .[] | "- `\(.RuleID)` \(.File):\(.StartLine) - \(.Description)"
+            end
+          ' gitleaks.json 2>/dev/null || echo '- Unavailable')
+          trivy_vulnerabilities=$(jq -r '
+            [.Results[]?.Vulnerabilities[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.VulnerabilityID)` [\(.Severity)] \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
+          trivy_misconfigurations=$(jq -r '
+            [.Results[]?.Misconfigurations[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.ID)` [\(.Severity)] \(.Title)"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
+          trivy_secrets=$(jq -r '
+            [.Results[]?.Secrets[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.RuleID // .Category)` [\(.Severity)] \(.Target // "unknown target")"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
+          {
+            echo "opengrep_status=${opengrep_status}"
+            echo "opengrep_findings=${opengrep_findings}"
+            echo "opengrep_blockers=${opengrep_blockers}"
+            echo "gitleaks_status=${gitleaks_status}"
+            echo "gitleaks_findings=${gitleaks_findings}"
+            echo "trivy_status=${trivy_status}"
+            echo "trivy_findings=${trivy_findings}"
+            echo "trivy_blockers=${trivy_blockers}"
+            echo "tests_status=${{ steps.go_test.outcome }}"
+            echo "vet_status=${{ steps.go_vet.outcome }}"
+            echo "opengrep_report<<EOF_OPENGREP"
+            printf '%s\n' "$opengrep_report"
+            echo "EOF_OPENGREP"
+            echo "gitleaks_report<<EOF_GITLEAKS"
+            printf '%s\n' "$gitleaks_report"
+            echo "EOF_GITLEAKS"
+            echo "trivy_vulnerabilities<<EOF_TRIVY_VULNS"
+            printf '%s\n' "$trivy_vulnerabilities"
+            echo "EOF_TRIVY_VULNS"
+            echo "trivy_misconfigurations<<EOF_TRIVY_MISCONFIG"
+            printf '%s\n' "$trivy_misconfigurations"
+            echo "EOF_TRIVY_MISCONFIG"
+            echo "trivy_secrets<<EOF_TRIVY_SECRETS"
+            printf '%s\n' "$trivy_secrets"
+            echo "EOF_TRIVY_SECRETS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Enforce security gate
+        if: always()
+        run: |
+          if [[ "${{ steps.report.outputs.opengrep_status }}" != "success" || \
+                "${{ steps.report.outputs.gitleaks_status }}" != "success" || \
+                "${{ steps.report.outputs.trivy_status }}" != "success" ]]; then
+            exit 1
+          fi
+
+      - name: Write PR summary
+        if: always()
+        run: |
+          {
+            echo "## PR Quality Gate"
+            echo
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Go tests, race detector, coverage, and vet ran in this job."
+            echo "- OpenGrep ERROR findings: ${{ steps.report.outputs.opengrep_findings }}"
+            echo "- Gitleaks findings: ${{ steps.report.outputs.gitleaks_findings }}"
+            echo "- Trivy filesystem findings across all severities: ${{ steps.report.outputs.trivy_findings }}"
+            echo "- Trivy blocking findings: ${{ steps.report.outputs.trivy_blockers }}"
+            echo "- Trivy scanned vulnerabilities, misconfigurations, and secrets."
+            echo "- Merge requires all quality and security gates to pass."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment PR with gate report
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          TESTS_STATUS: ${{ steps.report.outputs.tests_status }}
+          VET_STATUS: ${{ steps.report.outputs.vet_status }}
+          OPENGREP_STATUS: ${{ steps.report.outputs.opengrep_status }}
+          OPENGREP_FINDINGS: ${{ steps.report.outputs.opengrep_findings }}
+          OPENGREP_BLOCKERS: ${{ steps.report.outputs.opengrep_blockers }}
+          OPENGREP_REPORT: ${{ steps.report.outputs.opengrep_report }}
+          GITLEAKS_STATUS: ${{ steps.report.outputs.gitleaks_status }}
+          GITLEAKS_FINDINGS: ${{ steps.report.outputs.gitleaks_findings }}
+          GITLEAKS_REPORT: ${{ steps.report.outputs.gitleaks_report }}
+          TRIVY_STATUS: ${{ steps.report.outputs.trivy_status }}
+          TRIVY_FINDINGS: ${{ steps.report.outputs.trivy_findings }}
+          TRIVY_BLOCKERS: ${{ steps.report.outputs.trivy_blockers }}
+          TRIVY_VULNERABILITIES: ${{ steps.report.outputs.trivy_vulnerabilities }}
+          TRIVY_MISCONFIGURATIONS: ${{ steps.report.outputs.trivy_misconfigurations }}
+          TRIVY_SECRETS: ${{ steps.report.outputs.trivy_secrets }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = '<!-- pr-quality-gate-report -->';
+            const status = value => value === 'success' ? 'PASS' : value === 'skipped' ? 'SKIPPED' : 'FAIL';
+            const body = [
+              marker,
+              '## PR Quality Gate',
+              '',
+              '| Gate | Status | Result |',
+              '| --- | --- | --- |',
+              `| Go tests and race detector | ${status(process.env.TESTS_STATUS)} | ${process.env.TESTS_STATUS} |`,
+              `| go vet | ${status(process.env.VET_STATUS)} | ${process.env.VET_STATUS} |`,
+              `| OpenGrep SAST | ${status(process.env.OPENGREP_STATUS)} | ${process.env.OPENGREP_FINDINGS} findings; ${process.env.OPENGREP_BLOCKERS} blocking |`,
+              `| Gitleaks secrets | ${status(process.env.GITLEAKS_STATUS)} | ${process.env.GITLEAKS_FINDINGS} findings |`,
+              `| Trivy filesystem | ${status(process.env.TRIVY_STATUS)} | ${process.env.TRIVY_FINDINGS} findings; ${process.env.TRIVY_BLOCKERS} blocking |`,
+              '',
+              '### Scan Policy',
+              '',
+              '- OpenGrep reports `INFO`, `WARNING`, and `ERROR`; `ERROR` is blocking.',
+              '- Gitleaks has no severity scale; every detected secret is treated as blocking.',
+              '- Trivy reports `UNKNOWN`, `LOW`, `MEDIUM`, `HIGH`, and `CRITICAL` findings.',
+              '- Trivy blocks fixed `HIGH` and `CRITICAL` vulnerabilities plus all `HIGH` and `CRITICAL` misconfiguration/secret findings.',
+              '',
+              '<details><summary>OpenGrep finding list</summary>',
+              '',
+              process.env.OPENGREP_REPORT,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Gitleaks finding list</summary>',
+              '',
+              process.env.GITLEAKS_REPORT,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Trivy vulnerability/CVE list</summary>',
+              '',
+              process.env.TRIVY_VULNERABILITIES,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Trivy misconfiguration list</summary>',
+              '',
+              process.env.TRIVY_MISCONFIGURATIONS,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Trivy secret finding list</summary>',
+              '',
+              process.env.TRIVY_SECRETS,
+              '',
+              '</details>',
+              '',
+              `[View full workflow run](${process.env.WORKFLOW_URL})`,
+              '',
+              '_Updated automatically by GitHub Actions._',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

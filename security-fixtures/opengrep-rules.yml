@@ -1,0 +1,7 @@
+rules:
+  - id: demo-command-injection
+    languages:
+      - go
+    message: Test fixture contains shell execution with user-controlled input.
+    severity: ERROR
+    pattern: exec.Command("sh", "-c", $INPUT)
