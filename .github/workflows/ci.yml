@@ -61,11 +61,11 @@ jobs:
           scan-type: fs
           scan-ref: .
           scanners: vuln,misconfig,secret
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
           format: json
           output: trivy-fs.json
-          exit-code: '1'
+          exit-code: '0'
 
       - name: Prepare PR report
         id: report
@@ -79,20 +79,63 @@ jobs:
           if [[ -f trivy-fs.json ]]; then
             trivy_findings=$(jq '[.Results[]?.Vulnerabilities[]?, .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?] | length' trivy-fs.json 2>/dev/null || echo unavailable)
           fi
+          trivy_blockers=0
+          if [[ -f trivy-fs.json ]]; then
+            trivy_blockers=$(jq '[
+              .Results[]?.Vulnerabilities[]?
+              | select(.Severity == "HIGH" or .Severity == "CRITICAL")
+              | select((.FixedVersion // "") != "")
+            ] + [
+              .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?
+              | select(.Severity == "HIGH" or .Severity == "CRITICAL")
+            ] | length' trivy-fs.json 2>/dev/null || echo unavailable)
+          fi
+          trivy_status="${{ steps.trivy_fs.outcome }}"
+          if [[ "$trivy_status" == "success" && "$trivy_blockers" != "0" ]]; then
+            trivy_status=failure
+          fi
+          trivy_vulnerabilities=$(jq -r '
+            [.Results[]?.Vulnerabilities[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.VulnerabilityID)` [\(.Severity)] \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
+          trivy_misconfigurations=$(jq -r '
+            [.Results[]?.Misconfigurations[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.ID)` [\(.Severity)] \(.Title)"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
+          trivy_secrets=$(jq -r '
+            [.Results[]?.Secrets[]?]
+            | if length == 0 then "- None"
+              else .[] | "- `\(.RuleID // .Category)` [\(.Severity)] \(.Target // "unknown target")"
+              end
+          ' trivy-fs.json 2>/dev/null || echo '- Unavailable')
           {
             echo "opengrep_status=${{ steps.opengrep.outcome }}"
             echo "opengrep_findings=${opengrep_findings}"
-            echo "trivy_status=${{ steps.trivy_fs.outcome }}"
+            echo "trivy_status=${trivy_status}"
             echo "trivy_findings=${trivy_findings}"
+            echo "trivy_blockers=${trivy_blockers}"
             echo "tests_status=${{ steps.go_test.outcome }}"
             echo "vet_status=${{ steps.go_vet.outcome }}"
+            echo "trivy_vulnerabilities<<EOF_TRIVY_VULNS"
+            printf '%s\n' "$trivy_vulnerabilities"
+            echo "EOF_TRIVY_VULNS"
+            echo "trivy_misconfigurations<<EOF_TRIVY_MISCONFIG"
+            printf '%s\n' "$trivy_misconfigurations"
+            echo "EOF_TRIVY_MISCONFIG"
+            echo "trivy_secrets<<EOF_TRIVY_SECRETS"
+            printf '%s\n' "$trivy_secrets"
+            echo "EOF_TRIVY_SECRETS"
           } >> "$GITHUB_OUTPUT"
 
       - name: Enforce security gate
         if: always()
         run: |
           if [[ "${{ steps.opengrep.outcome }}" != "success" || \
-                "${{ steps.trivy_fs.outcome }}" != "success" ]]; then
+                "${{ steps.report.outputs.trivy_status }}" != "success" ]]; then
             exit 1
           fi
 
@@ -105,7 +148,8 @@ jobs:
             echo "- Commit: ${GITHUB_SHA}"
             echo "- Go tests, race detector, coverage, and vet ran in this job."
             echo "- OpenGrep ERROR findings: ${{ steps.report.outputs.opengrep_findings }}"
-            echo "- Trivy filesystem HIGH/CRITICAL findings with fixes: ${{ steps.report.outputs.trivy_findings }}"
+            echo "- Trivy filesystem findings across all severities: ${{ steps.report.outputs.trivy_findings }}"
+            echo "- Trivy blocking findings: ${{ steps.report.outputs.trivy_blockers }}"
             echo "- Trivy scanned vulnerabilities, misconfigurations, and secrets."
             echo "- Merge requires all quality and security gates to pass."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -121,6 +165,10 @@ jobs:
           OPENGREP_FINDINGS: ${{ steps.report.outputs.opengrep_findings }}
           TRIVY_STATUS: ${{ steps.report.outputs.trivy_status }}
           TRIVY_FINDINGS: ${{ steps.report.outputs.trivy_findings }}
+          TRIVY_BLOCKERS: ${{ steps.report.outputs.trivy_blockers }}
+          TRIVY_VULNERABILITIES: ${{ steps.report.outputs.trivy_vulnerabilities }}
+          TRIVY_MISCONFIGURATIONS: ${{ steps.report.outputs.trivy_misconfigurations }}
+          TRIVY_SECRETS: ${{ steps.report.outputs.trivy_secrets }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           script: |
@@ -135,13 +183,31 @@ jobs:
               `| Go tests and race detector | ${status(process.env.TESTS_STATUS)} | ${process.env.TESTS_STATUS} |`,
               `| go vet | ${status(process.env.VET_STATUS)} | ${process.env.VET_STATUS} |`,
               `| OpenGrep SAST | ${status(process.env.OPENGREP_STATUS)} | ${process.env.OPENGREP_FINDINGS} ERROR findings |`,
-              `| Trivy filesystem | ${status(process.env.TRIVY_STATUS)} | ${process.env.TRIVY_FINDINGS} HIGH/CRITICAL findings with fixes |`,
+              `| Trivy filesystem | ${status(process.env.TRIVY_STATUS)} | ${process.env.TRIVY_FINDINGS} findings; ${process.env.TRIVY_BLOCKERS} blocking |`,
               '',
               '### Scan Policy',
               '',
               '- OpenGrep blocks `ERROR` findings.',
-              '- Trivy scans vulnerabilities, misconfigurations, and secrets.',
-              '- Trivy blocks `HIGH` and `CRITICAL` findings only when a fix is available.',
+              '- Trivy reports `UNKNOWN`, `LOW`, `MEDIUM`, `HIGH`, and `CRITICAL` findings.',
+              '- Trivy blocks fixed `HIGH` and `CRITICAL` vulnerabilities plus all `HIGH` and `CRITICAL` misconfiguration/secret findings.',
+              '',
+              '<details><summary>Trivy vulnerability/CVE list</summary>',
+              '',
+              process.env.TRIVY_VULNERABILITIES,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Trivy misconfiguration list</summary>',
+              '',
+              process.env.TRIVY_MISCONFIGURATIONS,
+              '',
+              '</details>',
+              '',
+              '<details><summary>Trivy secret finding list</summary>',
+              '',
+              process.env.TRIVY_SECRETS,
+              '',
+              '</details>',
               '',
               `[View full workflow run](${process.env.WORKFLOW_URL})`,
               '',
