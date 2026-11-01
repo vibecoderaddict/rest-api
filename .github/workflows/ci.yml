@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: pr-quality-gate-${{ github.event.pull_request.number }}
@@ -28,9 +29,11 @@ jobs:
           cache: true
 
       - name: Run tests and coverage
+        id: go_test
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Run go vet
+        id: go_vet
         run: go vet ./...
 
       - name: Install OpenGrep
@@ -64,6 +67,27 @@ jobs:
           output: trivy-fs.json
           exit-code: '1'
 
+      - name: Prepare PR report
+        id: report
+        if: always()
+        run: |
+          opengrep_findings=0
+          trivy_findings=0
+          if [[ -f opengrep.json ]]; then
+            opengrep_findings=$(jq '[.results[]?] | length' opengrep.json 2>/dev/null || echo unavailable)
+          fi
+          if [[ -f trivy-fs.json ]]; then
+            trivy_findings=$(jq '[.Results[]?.Vulnerabilities[]?, .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?] | length' trivy-fs.json 2>/dev/null || echo unavailable)
+          fi
+          {
+            echo "opengrep_status=${{ steps.opengrep.outcome }}"
+            echo "opengrep_findings=${opengrep_findings}"
+            echo "trivy_status=${{ steps.trivy_fs.outcome }}"
+            echo "trivy_findings=${trivy_findings}"
+            echo "tests_status=${{ steps.go_test.outcome }}"
+            echo "vet_status=${{ steps.go_vet.outcome }}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Enforce security gate
         if: always()
         run: |
@@ -75,17 +99,68 @@ jobs:
       - name: Write PR summary
         if: always()
         run: |
-          opengrep_findings=0
-          trivy_findings=0
-          [[ -f opengrep.json ]] && opengrep_findings=$(jq '[.results[]?] | length' opengrep.json)
-          [[ -f trivy-fs.json ]] && trivy_findings=$(jq '[.Results[]?.Vulnerabilities[]?, .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?] | length' trivy-fs.json)
           {
             echo "## PR Quality Gate"
             echo
             echo "- Commit: ${GITHUB_SHA}"
             echo "- Go tests, race detector, coverage, and vet ran in this job."
-            echo "- OpenGrep ERROR findings: ${opengrep_findings}"
-            echo "- Trivy filesystem HIGH/CRITICAL findings with fixes: ${trivy_findings}"
+            echo "- OpenGrep ERROR findings: ${{ steps.report.outputs.opengrep_findings }}"
+            echo "- Trivy filesystem HIGH/CRITICAL findings with fixes: ${{ steps.report.outputs.trivy_findings }}"
             echo "- Trivy scanned vulnerabilities, misconfigurations, and secrets."
             echo "- Merge requires all quality and security gates to pass."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment PR with gate report
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          TESTS_STATUS: ${{ steps.report.outputs.tests_status }}
+          VET_STATUS: ${{ steps.report.outputs.vet_status }}
+          OPENGREP_STATUS: ${{ steps.report.outputs.opengrep_status }}
+          OPENGREP_FINDINGS: ${{ steps.report.outputs.opengrep_findings }}
+          TRIVY_STATUS: ${{ steps.report.outputs.trivy_status }}
+          TRIVY_FINDINGS: ${{ steps.report.outputs.trivy_findings }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = '<!-- pr-quality-gate-report -->';
+            const status = value => value === 'success' ? 'PASS' : value === 'skipped' ? 'SKIPPED' : 'FAIL';
+            const body = [
+              marker,
+              '## PR Quality Gate',
+              '',
+              '| Gate | Status | Result |',
+              '| --- | --- | --- |',
+              `| Go tests and race detector | ${status(process.env.TESTS_STATUS)} | ${process.env.TESTS_STATUS} |`,
+              `| go vet | ${status(process.env.VET_STATUS)} | ${process.env.VET_STATUS} |`,
+              `| OpenGrep SAST | ${status(process.env.OPENGREP_STATUS)} | ${process.env.OPENGREP_FINDINGS} ERROR findings |`,
+              `| Trivy filesystem | ${status(process.env.TRIVY_STATUS)} | ${process.env.TRIVY_FINDINGS} HIGH/CRITICAL findings with fixes |`,
+              '',
+              '### Scan Policy',
+              '',
+              '- OpenGrep blocks `ERROR` findings.',
+              '- Trivy scans vulnerabilities, misconfigurations, and secrets.',
+              '- Trivy blocks `HIGH` and `CRITICAL` findings only when a fix is available.',
+              '',
+              `[View full workflow run](${process.env.WORKFLOW_URL})`,
+              '',
+              '_Updated automatically by GitHub Actions._',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
