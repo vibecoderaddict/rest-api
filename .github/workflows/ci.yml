@@ -1,0 +1,91 @@
+name: PR Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-quality-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests and coverage
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Install OpenGrep
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/0439bebbd7cffcbad5c4014709fc0fe463872cdc/install.sh \
+            | bash -s -- -v v1.16.0
+          echo "$HOME/.opengrep/cli/latest" >> "$GITHUB_PATH"
+
+      - name: Run OpenGrep SAST
+        id: opengrep
+        continue-on-error: true
+        run: |
+          opengrep scan \
+            --config p/security-audit \
+            --severity ERROR \
+            --json-output=opengrep.json \
+            --sarif-output=opengrep.sarif \
+            --error .
+
+      - name: Run Trivy filesystem scan
+        id: trivy_fs
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: json
+          output: trivy-fs.json
+          exit-code: '1'
+
+      - name: Enforce security gate
+        if: always()
+        run: |
+          if [[ "${{ steps.opengrep.outcome }}" != "success" || \
+                "${{ steps.trivy_fs.outcome }}" != "success" ]]; then
+            exit 1
+          fi
+
+      - name: Write PR summary
+        if: always()
+        run: |
+          opengrep_findings=0
+          trivy_findings=0
+          [[ -f opengrep.json ]] && opengrep_findings=$(jq '[.results[]?] | length' opengrep.json)
+          [[ -f trivy-fs.json ]] && trivy_findings=$(jq '[.Results[]?.Vulnerabilities[]?, .Results[]?.Misconfigurations[]?, .Results[]?.Secrets[]?] | length' trivy-fs.json)
+          {
+            echo "## PR Quality Gate"
+            echo
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Go tests, race detector, coverage, and vet ran in this job."
+            echo "- OpenGrep ERROR findings: ${opengrep_findings}"
+            echo "- Trivy filesystem HIGH/CRITICAL findings with fixes: ${trivy_findings}"
+            echo "- Trivy scanned vulnerabilities, misconfigurations, and secrets."
+            echo "- Merge requires all quality and security gates to pass."
+          } >> "$GITHUB_STEP_SUMMARY"

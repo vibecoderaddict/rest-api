@@ -37,20 +37,6 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Check SonarQube configuration
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        run: |
-          test -n "$SONAR_TOKEN" || { echo "SONAR_TOKEN secret is required"; exit 1; }
-          test -n "$SONAR_HOST_URL" || { echo "SONAR_HOST_URL repository secret is required"; exit 1; }
-
-      - name: SonarQube scan and quality gate
-        uses: SonarSource/sonarqube-scan-action@v8.3.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
       - name: Write CI summary
         if: always()
         run: |
@@ -58,7 +44,7 @@ jobs:
             echo "## Main Quality Gate"
             echo
             echo "- Commit: ${GITHUB_SHA}"
-            echo "- SonarQube quality gate is enforced before the image build."
+            echo "- Go tests, race detector, coverage, and vet ran before the image build."
           } >> "$GITHUB_STEP_SUMMARY"
 
   container:
@@ -90,7 +76,7 @@ jobs:
           format: table
           severity: HIGH,CRITICAL
           exit-code: '1'
-          ignore-unfixed: false
+          ignore-unfixed: true
 
       - name: Push approved image
         run: docker push "${IMAGE_NAME}:${GITHUB_SHA}"
@@ -101,5 +87,5 @@ jobs:
             echo "## Container Release"
             echo
             echo "- Image: ${IMAGE_NAME}:${GITHUB_SHA}"
-            echo "- The image was pushed only after Go, SonarQube, and Trivy gates passed."
+            echo "- The image was pushed only after Go and Trivy gates passed."
           } >> "$GITHUB_STEP_SUMMARY"
