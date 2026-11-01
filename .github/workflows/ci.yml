@@ -35,8 +35,8 @@ jobs:
 
       - name: Install OpenGrep
         run: |
-          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/0439bebbd7cffcbad5c4014709fc0fe463872cdc/install.sh \
-            | bash -s -- -v v1.16.0
+          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/092c80faa0817840228349f93eff12a50fb9cf6b/install.sh \
+            | bash -s -- -v v1.33.1
           echo "$HOME/.opengrep/cli/latest" >> "$GITHUB_PATH"
 
       - name: Run OpenGrep SAST
